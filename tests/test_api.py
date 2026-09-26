@@ -596,6 +596,18 @@ def test_scanlines_outer_hole_island(client):
     assert by_y[6.0] == [[0.0, 2.0], [6.0, 10.0]]
 
 
+def test_scanlines_far_apart_unit_squares_end_to_end(client):
+    # 回归：x=1e9 处的第二个 1×1 方形不得把全局容差放大到吞掉自身宽度
+    pid = _mk(client, "M0,0h1v1h-1Z M1000000000,0h1v1h-1Z")
+    body = client.post(f"/paths/{pid}/scanlines",
+                       json={"spacing": 0.5}).json()
+    assert body["scanline_count"] == 2
+    assert body["bounds"] == {"miny": 0.0, "maxy": 1.0}
+    for line in body["lines"]:
+        assert line["intervals"] == [[0.0, 1.0],
+                                     [1000000000.0, 1000000001.0]]
+
+
 def test_scanlines_skips_open_and_degenerate(client):
     d = "M0,0h10v10h-10Z M5,5 L8,5 L5,5 Z M20,0 L30,0 L30,10"
     pid = _mk(client, d)
