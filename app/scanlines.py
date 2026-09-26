@@ -16,6 +16,14 @@ metrics / clearance 同一份解析与曲线细分折线，见
   外环/岛（深度偶数）计入，孔洞（深度奇数）扣除，最终输出每条线上
   升序、互不重叠的 ``[x_start, x_end]`` 填充区间。
 
+事件分组与零宽度判定只使用**逐交点的局部浮点不确定度**（按产生该交点
+时实际参与运算的操作数量级估计，见 :func:`_ring_crossings`），而**不是**
+按全体轮廓整体包围盒跨度缩放的全局容差：这样相距极远的小尺寸轮廓
+（例如一个 1×1 方形在原点、另一个在 x=10⁹）互不影响，各自的左右交点
+不会被全局比例容差并成同一点；而几何上共点的外环 / 孔洞 / 岛端点
+（共享顶点经插值得到的 x 仅差若干 ulp）仍会归入同一事件组正确抵消。
+宽度不超过两端局部不确定度之和的区间视为数值零宽度，不予输出。
+
 整个计算只读、即时完成：不依赖已保存的规范化结果，也不写库。
 没有任何有效闭合轮廓时返回空扫描线列表。
 """
@@ -31,9 +39,12 @@ from .svggeo import Contour
 MAX_SCANLINES = 1000
 # 输出量化位数（仅影响 JSON 展示，不改变判定）
 _DECIMALS = 9
-# 线条数 / 交点合并的相对浮点容差
+# 线条数计算的相对浮点容差
 _EPS_REL = 1e-12
-_X_EPS_REL = 1e-9
+# 机器 epsilon：单个双精度运算的相对舍入量级
+_MACH_EPS = 2.220446049250313e-16
+# 交点不确定度的保守倍数（覆盖若干次加减乘除与曲线细分点的累加误差）
+_INTERP_ERR_K = 16.0
 
 
 def compute_scanlines(contours: list[Contour],
@@ -79,9 +90,6 @@ def compute_scanlines(contours: list[Contour],
 
     miny = min(c.bounds[1] for c in valid)
     maxy = max(c.bounds[3] for c in valid)
-    minx = min(c.bounds[0] for c in valid)
-    maxx = max(c.bounds[2] for c in valid)
-    x_eps = _X_EPS_REL * max(1.0, maxx - minx, maxy - miny)
 
     # y < maxy（不含）：高度恰好是 spacing 整数倍时，线条数 = 高度/间距
     count = int(math.ceil((maxy - miny) / spacing - _EPS_REL))
@@ -91,10 +99,14 @@ def compute_scanlines(contours: list[Contour],
             f"扫描线数量 {count} 超过单次上限 {MAX_SCANLINES} 条，"
             f"请增大 spacing")
 
+    # 扫描线 y 坐标的量级（仅取决于实际 y 坐标，与轮廓 x 跨度无关）：
+    # 半开边判定按严格不等式，y 的表示误差量级只需覆盖到 y 自身
+    y_scale = max(1.0, abs(miny), abs(maxy))
+
     lines: list[dict[str, Any]] = []
     for k in range(count):
         y = miny + k * spacing
-        intervals = _line_intervals(valid, y, x_eps)
+        intervals = _line_intervals(valid, y, y_scale)
         lines.append({"y": _num(y),
                       "intervals": [[_num(a), _num(b)] for a, b in intervals]})
 
@@ -109,68 +121,99 @@ def compute_scanlines(contours: list[Contour],
 
 def _line_intervals(contours: list[Contour],
                     y: float,
-                    x_eps: float) -> list[tuple[float, float]]:
+                    y_scale: float) -> list[tuple[float, float]]:
     """求单条扫描线 ``y`` 上按深度交替合并后的升序填充区间。
 
     每个环先用半开边规则收集交点并两两配对，再把深度偶数环的区间
     作为 +1 事件、孔洞（奇数）作为 -1 事件做一维扫描：覆盖度由 0
     转正为区间起点，降回 0 为终点。
+
+    每个交点附带自身的**局部浮点不确定度**；事件按位置排序后，仅当
+    两位置之差不超过两者不确定度之和时才视为同一几何点合并——因此
+    远处轮廓上 1 个单位量级的局部区间不会被整体包围盒比例容差吞没，
+    而共点的外环 / 孔洞 / 岛端点仍抵消为 0、不产生伪区间。
     """
-    events: list[tuple[float, int]] = []
+    # (x, 覆盖度增量, 该交点的局部不确定度)
+    events: list[tuple[float, int, float]] = []
     for c in contours:
-        xs = _ring_crossings(c.points, y)
+        crossings = _ring_crossings(c.points, y, y_scale)
         # 正常情况下交点成对；防御性丢弃落单交点（异常相切配置）
-        if len(xs) % 2 == 1:
-            xs.pop()
+        if len(crossings) % 2 == 1:
+            crossings.pop()
         delta = 1 if c.depth % 2 == 0 else -1
-        xs.sort()
-        for i in range(0, len(xs), 2):
-            events.append((xs[i], delta))
-            events.append((xs[i + 1], -delta))
+        crossings.sort(key=lambda e: e[0])
+        for i in range(0, len(crossings), 2):
+            x0, e0 = crossings[i]
+            x1, e1 = crossings[i + 1]
+            events.append((x0, delta, e0))
+            events.append((x1, -delta, e1))
 
     if not events:
         return []
 
-    # 相同（在容差内）位置的事件先合并，保证嵌套环端点共点时覆盖度正确
+    # 相同（在各自局部不确定度内）位置的事件先合并，保证嵌套环端点
+    # 共点时覆盖度正确；判定不使用全局包围盒比例容差，远处小轮廓互不吞并
     events.sort(key=lambda e: e[0])
-    groups: list[tuple[float, int]] = []
-    for x, delta in events:
-        if groups and abs(x - groups[-1][0]) <= x_eps:
-            groups[-1] = (groups[-1][0], groups[-1][1] + delta)
+    # 每组：(代表 x, 覆盖度增量合计, 组内最大局部不确定度)
+    groups: list[tuple[float, int, float]] = []
+    for x, delta, eps in events:
+        if groups and abs(x - groups[-1][0]) <= groups[-1][2] + eps:
+            gx, gd, ge = groups[-1]
+            groups[-1] = (gx, gd + delta, max(ge, eps))
         else:
-            groups.append((x, delta))
+            groups.append((x, delta, eps))
 
     intervals: list[tuple[float, float]] = []
     coverage = 0
     start = 0.0
-    for x, delta in groups:
+    start_eps = 0.0
+    for x, delta, eps in groups:
         before = coverage
         coverage += delta
         if before == 0 and coverage > 0:
-            start = x
+            start, start_eps = x, eps
         elif before > 0 and coverage == 0:
-            if x - start > x_eps:  # 丢弃数值零宽度区间
+            # 宽度不超过两端数值不确定度之和即为数值零宽度，丢弃
+            if x - start > start_eps + eps:
                 intervals.append((start, x))
     return intervals
 
 
 def _ring_crossings(points: list[tuple[float, float]],
-                    y: float) -> list[float]:
-    """半开边规则下扫描线与闭合环各边的交点 x 坐标。
+                    y: float,
+                    y_scale: float) -> list[tuple[float, float]]:
+    """半开边规则下扫描线与闭合环各边的交点 ``(x, 不确定度)``。
 
     判定 ``(y1 > y) != (y2 > y)``：
     - 水平边两端同侧，永不计数；
     - 穿过顶点时，上行/下行两条邻边恰有一条满足，顶点不重复计数；
     - 局部极值处两条邻边同侧，按切线处理（计 0 次）。
+
+    每个交点的不确定度按产生它的实际运算估计：
+    ``x = x1 + (x2-x1) * (y-y1)/(y2-y1)`` 的舍入误差只与**该边端点与
+    扫描线自身的坐标量级**以及该边的水平跨度有关，与本轮廓之外是否存在
+    10⁹ 量级的远处轮廓无关：
+
+    - 竖边（``dx=0``）的交点 x 恒等于端点 x，不确定度仅为端点表示量级；
+    - 边近乎水平时扫描线 y 的表示误差经 ``|dx|/|dy|`` 斜率放大，
+      按实际水平跨度计入，不把远处轮廓的跨度带进来。
     """
-    xs: list[float] = []
+    out: list[tuple[float, float]] = []
     n = len(points)
     for k in range(n):
         x1, y1 = points[k]
         x2, y2 = points[(k + 1) % n]
         if (y1 > y) != (y2 > y):
-            xs.append(x1 + (x2 - x1) * (y - y1) / (y2 - y1))
-    return xs
+            dx, dy = x2 - x1, y2 - y1
+            t = (y - y1) / dy
+            x = x1 + dx * t
+            scale = max(1.0, abs(x1), abs(x2), abs(y1), abs(y2))
+            # 端点/插值若干次舍入的误差
+            eps = _INTERP_ERR_K * _MACH_EPS * scale
+            # 扫描线 y 的表示误差经斜率 |dx|/|dy| 放大（竖边 dx=0，无此项）
+            eps += _INTERP_ERR_K * _MACH_EPS * y_scale * abs(dx) / abs(dy)
+            out.append((x, eps))
+    return out
 
 
 def _num(v: float) -> float:
